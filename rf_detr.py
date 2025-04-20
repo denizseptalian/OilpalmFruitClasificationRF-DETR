@@ -1,149 +1,74 @@
 import streamlit as st
+import cv2
 import numpy as np
 from PIL import Image
 from collections import Counter
 import base64
 from io import BytesIO
-from rfdetr import RFDETRBase  # Menggunakan model RF-DETR
-import supervision as sv
+import onnxruntime as ort
+from supervision import BoxAnnotator, LabelAnnotator, Color, Detections
 
 # Konfigurasi halaman
 st.set_page_config(page_title="Deteksi Buah Sawit", layout="centered")
 
-# Load model RF-DETR
+# Load model ONNX
 @st.cache_resource
 def load_model():
-    model = RFDETRBase()
-    model.load("checkpoint_best_total.pth")  # Load model pre-trained
-    return model
+    session = ort.InferenceSession("inference_model.onnx", providers=["CPUExecutionProvider"])
+    return session
 
-# Fungsi prediksi
-def predict_image(model, image):
-    image = np.array(image.convert("RGB"))
-    results = model.predict(image)  # Gunakan method prediksi yang sesuai
-    return results
+# Fungsi prediksi ONNX
+def predict_image(session, image):
+    img = np.array(image.convert("RGB"))
+    img_resized = cv2.resize(img, (640, 640))
+    img_input = img_resized.transpose(2, 0, 1).astype(np.float32) / 255.0
+    img_input = np.expand_dims(img_input, axis=0)
+
+    inputs = {session.get_inputs()[0].name: img_input}
+    outputs = session.run(None, inputs)
+
+    return outputs  # akan diproses di draw_results
 
 # Warna bounding box sesuai label
 label_to_color = {
-    "Masak": sv.Color.RED,
-    "Mengkal": sv.Color.YELLOW,
-    "Mentah": sv.Color.BLACK
+    "Masak": Color.RED,
+    "Mengkal": Color.YELLOW,
+    "Mentah": Color.BLACK
 }
 
-# Gambar hasil deteksi
-def draw_results(image, results):
+label_annotator = LabelAnnotator()
+
+# Fungsi untuk parsing output ONNX RF-DETR (disesuaikan dengan output spesifik model)
+def draw_results(image, outputs):
     img = np.array(image.convert("RGB"))
     class_counts = Counter()
 
-    for result in results:
-        boxes = result['boxes']
-        names = result['names']
+    # Output parsing tergantung struktur model ONNX kamu
+    boxes, scores, class_ids = outputs  # contoh umum: [N, 4], [N], [N]
 
-        xyxy = boxes['xyxy']
-        class_ids = boxes['cls'].astype(int)
-        confidences = boxes['conf']
+    boxes = np.array(boxes)
+    scores = np.array(scores)
+    class_ids = np.array(class_ids).astype(int)
 
-        for box, class_id, conf in zip(xyxy, class_ids, confidences):
-            class_name = names[class_id]
-            label = f"{class_name}: {conf:.2f}"
-            color = label_to_color.get(class_name, sv.Color.WHITE)
+    for box, score, class_id in zip(boxes, scores, class_ids):
+        if score < 0.3:
+            continue
 
-            class_counts[class_name] += 1
+        x_min, y_min, x_max, y_max = box
+        label_name = {0: "Mentah", 1: "Mengkal", 2: "Masak"}.get(class_id, f"Kelas {class_id}")
+        label = f"{label_name}: {score:.2f}"
+        color = label_to_color.get(label_name, Color.WHITE)
 
-            box_annotator = sv.BoxAnnotator(color=color)
-            img = box_annotator.annotate(scene=img, detections=boxes)
+        class_counts[label_name] += 1
+
+        box_annotator = BoxAnnotator(color=color)
+        detection = Detections(
+            xyxy=np.array([[x_min, y_min, x_max, y_max]]),
+            confidence=np.array([score]),
+            class_id=np.array([class_id])
+        )
+
+        img = box_annotator.annotate(scene=img, detections=detection)
+        img = label_annotator.annotate(scene=img, detections=detection, labels=[label])
 
     return img, class_counts
-
-# Inisialisasi
-if "camera_image" not in st.session_state:
-    st.session_state["camera_image"] = ""
-
-# Judul
-st.title("📷 Deteksi dan Klasifikasi Kematangan Buah Sawit")
-st.markdown("Pilih metode input gambar:")
-option = st.radio("", ["Upload Gambar", "Gunakan Kamera"])
-image = None
-
-# Upload gambar
-if option == "Upload Gambar":
-    uploaded_file = st.file_uploader("Unggah gambar", type=["jpg", "jpeg", "png"])
-    if uploaded_file:
-        image = Image.open(uploaded_file)
-        st.image(image, caption="Gambar yang diunggah", use_container_width=True)
-
-# Kamera langsung
-elif option == "Gunakan Kamera":
-    st.markdown("### Kamera Belakang (Environment)")
-
-    # HTML kamera + tombol ambil gambar
-    camera_html = """
-    <div style="text-align:center;">
-        <video id="video" autoplay playsinline style="width:100%; border:1px solid gray;"></video>
-        <br/>
-        <button onclick="takePhoto()" style="margin-top:10px; padding:10px 20px;">📸 Ambil Gambar</button>
-        <canvas id="canvas" style="display:none;"></canvas>
-    </div>
-
-    <script>
-        async function startCamera() {
-            try {
-                const stream = await navigator.mediaDevices.getUserMedia({
-                    video: { facingMode: { ideal: "environment" } },
-                    audio: false
-                });
-                const video = document.getElementById('video');
-                video.srcObject = stream;
-            } catch (err) {
-                alert("Gagal mengakses kamera: " + err.message);
-            }
-        }
-
-        function takePhoto() {
-            const video = document.getElementById('video');
-            const canvas = document.getElementById('canvas');
-            const context = canvas.getContext('2d');
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
-            context.drawImage(video, 0, 0, canvas.width, canvas.height);
-            const dataURL = canvas.toDataURL('image/png');
-
-            const input = window.parent.document.querySelector('input[data-testid="stTextInput"]');
-            if (input) {
-                input.value = dataURL;
-                input.dispatchEvent(new Event("input", { bubbles: true }));
-            }
-        }
-
-        document.addEventListener("DOMContentLoaded", startCamera);
-    </script>
-    """
-
-    # Tampilkan komponen HTML
-    st.components.v1.html(camera_html, height=600)
-
-    # Gunakan text_input sebagai "jembatan"
-    base64_img = st.text_input("Gambar dari Kamera (tersembunyi)", type="default", label_visibility="collapsed")
-
-    if base64_img.startswith("data:image"):
-        st.session_state["camera_image"] = base64_img
-
-        try:
-            header, encoded = base64_img.split(",", 1)
-            decoded = base64.b64decode(encoded)
-            image = Image.open(BytesIO(decoded))
-            st.image(image, caption="📷 Gambar dari Kamera", use_container_width=True)
-        except Exception as e:
-            st.error(f"Gagal memproses gambar dari kamera: {e}")
-
-# Proses deteksi
-if image:
-    with st.spinner("🔍 Memproses gambar..."):
-        model = load_model()
-        results = predict_image(model, image)
-        img_with_boxes, class_counts = draw_results(image, results)
-
-        st.image(img_with_boxes, caption="📊 Hasil Deteksi", use_container_width=True)
-        st.subheader("Jumlah Objek Terdeteksi:")
-        for name, count in class_counts.items():
-            st.write(f"- **{name}**: {count}")
