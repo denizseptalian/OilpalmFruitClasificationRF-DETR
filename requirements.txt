@@ -1,0 +1,11 @@
+streamlit
+opencv-python-headless
+numpy
+Pillow
+torch
+torchvision
+supervision
+matplotlib
+pandas
+roboflow
+rfdetr
