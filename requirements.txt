@@ -2,9 +2,5 @@ streamlit
 opencv-python-headless
 numpy
 Pillow
-torch
-torchvision
+onnxruntime
 supervision
-matplotlib
-pandas
-roboflow
